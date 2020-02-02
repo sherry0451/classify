@@ -1,0 +1,23 @@
+from sklearn import svm
+import h5py
+
+
+train_data = h5py.File('indian_train.h5', 'r')
+train_set = train_data['data']
+train_label = train_data['gt']
+print(train_set.shape, train_label.shape)
+test_data = h5py.File('indian_test.h5', 'r')
+test_set = test_data['data']
+test_label = test_data['gt']
+print(test_set.shape, test_label.shape)
+all_data = h5py.File('indian_all.h5', 'r')
+all_set = all_data['data']
+all_label = all_data['gt']
+print(all_set.shape, all_label.shape)
+#3.训练svm分类器
+classifier=svm.SVC(C=2,kernel='rbf',gamma=10,decision_function_shape='ovr') # ovr:一对多策略
+classifier.fit(train_data,train_label.ravel()) #ravel函数在降维时默认是行序优先
+# print(classifier.predict(test_data))
+# 4.计算svc分类器的准确率
+print("训练集：", classifier.score(train_data, train_label))
+print("测试集：", classifier.score(test_data, test_label))
