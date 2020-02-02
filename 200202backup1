@@ -1,0 +1,103 @@
+from google.colab import drive
+drive.mount('/content/drive/')
+import os 
+os.chdir('/content/drive/My Drive/Colab Notebooks/')
+!ls
+
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io as sio
+from keras.models import Sequential, Model, load_model
+from keras.layers import Conv3D, MaxPooling3D, Permute
+from keras.layers import Activation, Dropout, Flatten, Dense, BatchNormalization, Input, concatenate
+from keras.utils.np_utils import to_categorical
+from keras.optimizers import Adam, SGD
+import keras.callbacks as kcallbacks
+from keras.regularizers import l2
+import time
+import h5py
+# from dataset_utils import sv2h5_array, r_h5
+
+train_data = h5py.File('indian_train.h5', 'r')
+train_set = train_data['data']
+train_label = train_data['gt'][:]
+print(train_set.shape, train_label.shape)
+test_data = h5py.File('indian_test.h5', 'r')
+test_set = test_data['data']
+test_label = test_data['gt'][:]
+print(test_set.shape, test_label.shape)
+all_data = h5py.File('indian_all.h5', 'r')
+all_set = all_data['data']
+all_label = all_data['gt'][:]
+print(all_set.shape, all_label.shape)
+
+input_img = Input(shape=(200,))
+encoder = Dense(128, activation='relu')(input_img)
+# encoder = Dropout(0.1)(encoder)
+encoder = Dense(64, activation='relu')(encoder)
+# encoder = Dropout(0.25)(encoder)
+encoder_output = Dense(32)(encoder)
+
+dencoder = Dense(64, activation='relu')(encoder_output)
+dencoder = Dense(128, activation='relu')(dencoder)
+dencoder = Dense(200, activation='sigmoid')(dencoder)
+
+result = Dense(16, activation='relu')(encoder_output)
+result = Dense(13, activation='softmax')(result)
+autoencoder = Model(input=input_img, output=dencoder)
+coder = Model(input=input_img, output=encoder_output)
+classify = Model(input=input_img, output=result)
+
+autoencoder.summary()
+autoencoder.compile(optimizer='adam', loss='mse')
+# setting
+# best_weights_new = 'newmodel_saved.hdf5'
+# earlyStopping6 = kcallbacks.EarlyStopping(monitor='val_loss', patience=patience, verbose=0, mode='auto')
+# saveBestModel6 = kcallbacks.ModelCheckpoint(best_weights_new, monitor='val_loss',verbose=0,
+#                                             save_best_only=True,
+#                                             mode='auto')
+autoencoder.fit(all_set, all_set, nb_epoch=100, batch_size=64, shuffle='batch')
+classify.compile(optimizer=Adam(lr=0.001, decay= 1e-3, beta_1=0.9, beta_2=0.999),loss='categorical_crossentropy', metrics=['accuracy'])
+classify.summary()
+ctrain_label = to_categorical(train_label-1)
+classify.fit(train_set, ctrain_label,nb_epoch=100, batch_size=64, shuffle='batch')
+code = coder.predict(all_set)
+
+ctest_label = to_categorical(test_label-1)
+tic7 = time.clock()
+loss_and_metrics_new = classify.evaluate(test_set, ctest_label, batch_size=64)
+toc7 = time.clock()
+
+
+print('new_model Test time:', toc7 - tic7)
+
+print('new_model Test score:', loss_and_metrics_new[0])
+print('new_model Test accuracy:', loss_and_metrics_new[1])
+# sv2h5_array(img_coder, 'predict_img.h5')
+# code = r_h5('predict_img.h5','data')
+print(code[0:390].shape, train_label.shape)
+
+# # plt.scatter(img_coder[:,0],img_coder[:,1], c=all_label[:,0])
+# # plt.colorbar
+# # plt.show
+# from mpl_toolkits.mplot3d import Axes3D
+# from matplotlib import cm
+# fig = plt.figure()
+# ax = Axes3D(fig)
+# X = img_coder[:,0]
+# Y = img_coder[:,1]
+# Z = img_coder[:,2]
+# Label = all_label[:,0]
+# for x,y,z,s in zip(X,Y,Z,Label):
+#   c=cm.rainbow(int(255*s/9))
+#   ax.text(x,y,z,s,backgroundcolor=c)
+# ax.set_xlim(X.min(), X.max()); ax.set_ylim(Y.min(),Y.max()); ax.set_zlim(Z.min(),Z.max())
+# plt.show()
+
+#3.训练svm分类器
+from sklearn import svm
+classifier=svm.SVC(C=2,kernel='rbf',gamma=10,decision_function_shape='ovr') # ovr:一对多策略
+classifier.fit(code[:390],train_label)
+
+print("训练集：", classifier.score(code[:390],train_label))
+print("测试集：", classifier.score(code[390:],test_label))
