@@ -1,0 +1,780 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# author：S.Yao time:20-1-27
+
+import numpy as np
+import cv2
+import gdal
+import random
+import math
+import os
+from os.path import exists
+import scipy.io as sio
+import matplotlib.pyplot as plt
+import h5py
+
+
+def mat_read(file_name):
+    file_path = os.getcwd()
+    data_path = file_path  # os.path.join(file_path,'Data')
+    mat_dict = sio.loadmat(os.path.join(data_path, file_name + '.mat'))
+    # print("data_dict keys:", mat_dict.keys())
+    data_k = list(mat_dict.keys())[-1]
+    data_mat = mat_dict[data_k]
+    # if data_mat.ndim == 2:
+    #     data_mat = data_mat[:,:,np.newaxis]
+    # elif data_mat.ndim == 3:
+    #     data_mat = data_mat
+    # else:
+    #     print('check the image dim.')
+    print(file_name, data_mat.shape)
+    print('mat image_or max:{max} min:{min}'.format(max=np.max(data_mat), min=np.min(data_mat)))
+    print(file_name, 'loading finished.\n')
+    return data_mat
+
+
+def gdal_read(file_name, mode = 'bdlast'):
+    """
+    need setup gdal
+    conda install gdal
+    :input: tif
+    :return image array
+    """
+    file = gdal.Open(file_name)
+    image = file.ReadAsArray()
+    name = file_name[:-4]
+    print(name + 'image shape is:',image.shape)
+    if image.ndim == 2:
+        image = image[np.newaxis,:,:]
+    elif image.ndim == 3:
+        image = image
+    else:
+        print('check the image dim.')
+    if mode == 'bdlast':
+        image = image.transpose(1, 2, 0)
+    else:
+        print('origin image is already right order.')
+    print('tif image type:', image.dtype, 'tif image shape is:',image.shape)
+    print('tif image max:{max} min:{min}'.format(max=np.max(image), min=np.min(image)))
+    return image
+
+
+def sampling_num(num_train, groundTruth, min_limit=50, seeds=1223, shf=True):  # divide dataset into train and test datasets
+    w,h = groundTruth.shape
+    labels_loc = {}
+    train = {}
+    test = {}
+    m = np.max(groundTruth)
+    gt_total = np.zeros(m)
+    avi_gt_total = []
+    np.random.seed(seeds)
+    gt1d = groundTruth.ravel().tolist()
+    for i in range(m):
+        indices = [j for j, x in enumerate(gt1d) if x == i + 1]
+        np.random.shuffle(indices)
+        labels_loc[i] = indices
+        gt_total[i] = len(indices)
+    avi_label_loc = {}
+    k = 0
+    avi_class = []
+    del_class = []
+    for i in range(m):
+        if gt_total[i] > min_limit:
+            avi_label_loc[k] = labels_loc[i]
+            temp_loc = avi_label_loc[k]
+            train[k] = temp_loc[:num_train]
+            test[k] = temp_loc[num_train:]
+            avi_gt_total.append(len(temp_loc))
+            k += 1
+            avi_class.append(i + 1)
+        else:
+            del_class.append(i + 1)
+            print('delete class with label:', i+1)
+    print(avi_class, del_class)
+    for i in range(len(del_class)):
+        for m, n in enumerate(gt1d):
+            if n == del_class[i]:
+                # print('mn', m, n, del_class[i])
+                gt1d[m] = 0
+        for p, q in enumerate(gt1d):
+            if q == avi_class[-1 - i]:
+                gt1d[p] = del_class[i]
+    new = np.array(gt1d, dtype=int).reshape(w,h)
+    total_num = np.sum(avi_gt_total)
+    class_num = len(avi_gt_total)
+    # number of each class: [  46. 1428.  830.  237.  483.  730.   28.  478.   20.  972. 2455.  593.
+    #   205. 1265.  386.   93.]
+    print('number of each class:', avi_gt_total, '\ntotal:',total_num, 'avi_class:',class_num)
+    whole_indices = []
+    train_indices = []
+    test_indices = []
+    for i in range(class_num):
+        whole_indices += avi_label_loc[i]
+        train_indices += train[i]
+        test_indices += test[i]
+    if shf:
+        np.random.shuffle(train_indices)
+    np.random.shuffle(test_indices)
+
+    # new_labels_loc={}
+    # new_gt_total=np.zeros(class_num)
+    # for i in range(class_num):
+    #     indices = [j for j, x in enumerate(gt1d) if x == i + 1]
+    #     new_labels_loc[i] = indices
+    #     new_gt_total[i] = len(indices)
+    # print(new_gt_total)
+    return whole_indices, train_indices, test_indices, new
+
+
+def LP2HP(LP, n_factor, BorE):
+    """
+    single low position transforms to high position
+    :param LP: low
+    :param n_factor: super resolution
+    :param BorE: 0-mode is begin, 1-mode is end
+    :return: high
+    """
+    HP = 0
+    if BorE == 0:
+        HP = LP * n_factor
+    elif BorE == 1:
+        HP = LP * n_factor+n_factor-1
+    else:
+        print('BorE is error.')
+    return HP
+
+# def HP2LP(hp, n_factor, BorE):
+#     lp = 0
+#     if BorE == 0:
+#         lp = hp / n_factor
+#     elif BorE == 1:
+#         lp = (hp - n_factor + 1) / n_factor
+#     else:
+#         print('BorE is error.')
+#     assert type(lp) == 'int', 'HP2LP: the n_factor is wrong.'
+#     return lp
+
+def list2pos(lis, col):
+    """
+    reshape a list to a array
+    :param lis: number in the list
+    :param col: column of array
+    :return: number in the array
+    """
+    x = lis//col
+    y = lis%col
+    return x,y
+
+def mn2xy(mn, stride):
+    """
+    number in the array transform to the real position
+    :param mn: row m colunm n ,start is m=0,n=0
+    :param stride: stride
+    :return: position (x,y)
+    """
+    x = mn[0]*stride
+    y = mn[1]*stride
+    return x,y
+
+def selectpatch(image, start, size):
+    """
+    select a block in an image
+    :param image: origin image
+    :param start: start position
+    :param size: the size of the block
+    :return: new block image, shape is size * size, a square image
+    """
+    select = image[start[0]:start[0]+size,start[1]:start[1]+size]
+    return select
+
+def cutedge(image_M, image_P, position, n_factor):
+    """
+    cut a singel block according to the position,get M and P
+    :param position: 0-based ,like matlab,from a to b,include a and b
+    """
+    new_M = image_M[position[0]:position[1]+1, position[2]:position[3]+1]
+    position_P = np.ones((4,), dtype=np.int)
+    position_P[0] = LP2HP(position[0], n_factor, 0)
+    position_P[1] = LP2HP(position[1], n_factor, 1)
+    position_P[2] = LP2HP(position[2], n_factor, 0)
+    position_P[3] = LP2HP(position[3], n_factor, 1)
+    new_P = image_P[position_P[0]:position_P[1]+1, position_P[2]:position_P[3]+1]
+    return new_M, new_P
+
+def cutline(image,num, mode='row'):
+    """
+    split a image into two images by a line
+    include num line
+    """
+    image_train = []
+    image_test = []
+    if mode == 'row':
+        image_train = image[:num+1]
+        image_test = image[num+1:]
+    elif mode == 'column':
+        image_train = image[:, :num+1]
+        image_test = image[:, num+1:]
+    else:
+        print('mode is wrong.')
+    return image_train, image_test
+
+
+def mmnorm(dataset, offset=0, peak='False'):
+    """
+    maxmin normalization
+    """
+    datamax = np.max(dataset)
+    datamin = np.min(dataset)
+    # print('data_max:', datamax)
+    # print('data_min:', datamin)
+    normdata = (dataset-datamin)/(datamax-datamin)-offset
+    if peak=='False':
+        return normdata
+    elif peak == 'True':
+        return normdata, datamin, datamax
+    else:
+        print('mode peak or not?')
+
+def inmmnorm(dataset, max, min):
+    oridata = dataset*(max-min) + min
+    return oridata
+
+def remove_if_exist(file_name):
+    if exists(file_name):
+        os.remove(file_name)
+    return
+
+def calcu_total(patch_size, large_shape, stride):
+    assert len(patch_size) == 2, 'patch_size input wrong.'
+    assert len(large_shape) == 3, 'large_shape input wrong.'
+    assert len(stride) == 2, 'stride input wrong.'
+    large_height = large_shape[0]
+    large_width = large_shape[1]
+    mmax = 0
+    nmax = 0
+    newheight = patch_size[0]
+    newwide = patch_size[1]
+    stride_h = stride[0]
+    stride_w = stride[1]
+    assert newheight <= large_width, 'patch height is larger than image.'
+    assert newwide <= large_width, 'patch width is larger than image.'
+    while newheight <= large_height:
+        mmax = mmax + 1
+        newheight += stride_h
+    else:
+        print('rowmax is {mmax}'.format(mmax=mmax))
+    while newwide <= large_width:
+        nmax = nmax + 1
+        newwide += stride_w
+    else:
+        print('columnmax is {nmax}'.format(nmax=nmax))
+    total = mmax * nmax
+    print('total is {total}'.format(total=total))
+    return mmax, nmax, total
+
+def result_clip(img, verbose='False'):
+    img2 = np.copy(img)
+    sz = np.shape(img2)
+    for i in range(0,sz[2]):
+        I2 = img2[:,:,i]
+        I2[I2 > 1.0] = 1.0
+        I2[I2 < 0.0] = 0.0
+        img2[:,:,i] = I2
+    if verbose == 'True':
+        print('clipped image max and min:', np.max(img2), np.min(img2))
+    return img2
+
+def image_blur(img_ms, img_pan, n_factor=4, verbose='False'):
+    """
+        This function generates the blurred version of the original input multispectral image, and the
+        downsampled panchromatic.
+
+        Inputs:
+        - img_ms: Numpy array of the original multispectral image which is to be used for training
+        - img_pan: Numpy array of the original panchromatic image which is to be used for training
+        - n_factor: The ratio of pixel resolution of multispectral image to that of the panchromatic image
+
+        Outputs:
+        - blurred_img_ms_small: Numpy array of blurred multispectral image and downsampled panchromatic image
+        - downsampled_img_pan:   Numpy array of downsampled panchromatic image
+
+    """
+    blurred_img_ms = np.zeros((img_ms.shape))
+
+    for i in range(img_ms.shape[2]):
+        blurred_img_ms[:, :, i] = cv2.GaussianBlur(img_ms[:, :, i], (5, 5), 0)
+    # blurred_img_ms_small = cv2.resize(blurred_img_ms,
+    #                                   (int(img_ms.shape[1] / n_factor), int(img_ms.shape[0] / n_factor)),
+    #                                   interpolation=cv2.INTER_AREA)
+    blurred_img_ms_small = cv2.resize(blurred_img_ms,
+                                      (int(img_ms.shape[1] / n_factor), int(img_ms.shape[0] / n_factor)),
+                                      interpolation=cv2.INTER_CUBIC)
+
+    # blurred_img_ms_sam = cv2.resize(blurred_img_ms_small, (img_ms.shape[1], img_ms.shape[0]),
+    #                                  interpolation=cv2.INTER_CUBIC)
+
+    # downsampled_img_pan = cv2.resize(img_pan, (img_ms.shape[1], img_ms.shape[0]), interpolation=cv2.INTER_AREA)
+    downsampled_img_pan = cv2.resize(img_pan, (img_ms.shape[1], img_ms.shape[0]), interpolation=cv2.INTER_CUBIC)
+    downsampled_img_pan = downsampled_img_pan[:,:,np.newaxis]
+    # downsampled_img_pan = np.expand_dims(downsampled_img_pan, axis=2)
+    if verbose == 'True':
+        print('blurred_img_ms_small max and min:', np.max(blurred_img_ms_small), np.min(blurred_img_ms_small))
+        print('downsampled_img_pan max and min:', np.max(downsampled_img_pan), np.min(downsampled_img_pan))
+
+    return blurred_img_ms_small, downsampled_img_pan
+
+def image_blurS(img_ms, n_factor=4, verbose='False'):
+    """
+        This function generates the blurred version of the original input multispectral image, and the
+        downsampled panchromatic.
+
+        Inputs:
+        - img_ms: Numpy array of the original multispectral image which is to be used for training
+        - img_pan: Numpy array of the original panchromatic image which is to be used for training
+        - n_factor: The ratio of pixel resolution of multispectral image to that of the panchromatic image
+
+        Outputs:
+        - blurred_img_ms_small: Numpy array of blurred multispectral image and downsampled panchromatic image
+        - downsampled_img_pan:   Numpy array of downsampled panchromatic image
+
+    """
+    blurred_img_ms = np.zeros((img_ms.shape))
+
+    for i in range(img_ms.shape[2]):
+        blurred_img_ms[:, :, i] = cv2.GaussianBlur(img_ms[:, :, i], (5, 5), 0)
+    blurred_img_ms_small = cv2.resize(blurred_img_ms,
+                                      (int(img_ms.shape[1] / n_factor), int(img_ms.shape[0] / n_factor)),
+                                      interpolation=cv2.INTER_AREA)
+    # blurred_img_ms_sam = cv2.resize(blurred_img_ms_small, (img_ms.shape[1], img_ms.shape[0]),
+    #                                 interpolation=cv2.INTER_CUBIC)
+    if verbose == 'True':
+        print('blurred_img_ms_small max and min:', np.max(blurred_img_ms_small), np.min(blurred_img_ms_small))
+    return blurred_img_ms_small
+
+def image_interpolation(img_ms, n_factor=4, verbose='False'):
+    img_large = cv2.resize(img_ms, (int(img_ms.shape[1] * n_factor), int(img_ms.shape[0] * n_factor)),
+                                      interpolation=cv2.INTER_CUBIC)
+
+    # img_large = cv2.resize(img_ms, (int(img_ms.shape[1] * n_factor), int(img_ms.shape[0] * n_factor)),
+    #                                   interpolation=cv2.INTER_AREA)
+    # img_ms_large = cv2.resize(img_ms, (int(img_ms.shape[1] / n_factor), int(img_ms.shape[0] / n_factor)),
+    #                                   interpolation=cv2.INTER_AREA)
+    if verbose == 'True':
+        print('image_interpolation max and min:', np.max(img_large), np.min(img_large))
+    img_large = result_clip(img_large)
+
+    return img_large
+
+def seg_img(img_m, img_p, num_inheigh, num_inwidth, ratio=4):
+    """
+    make img_m get int when divide num_row*ratio ,num_col*ratio
+
+    """
+    h, w, b = img_m.shape
+    hp, wp, bp = img_p.shape
+    assert hp/h == wp/w, "M and P don't match."
+    mpratio = hp // h
+    cut_h = h - h % (num_inheigh * ratio)
+    cut_w = w - w % (num_inwidth * ratio)
+    # print('cut h',cut_h,'cut w', cut_w)
+    m_set = []
+    p_set = []
+    sub_h = cut_h // num_inheigh
+    # print('subh', sub_h, type(sub_h))
+    sub_w = cut_w // num_inwidth
+    for x in range(0, cut_h, sub_h):
+        for y in range(0, cut_w, sub_w):
+            seged_m = img_m[x: x+sub_h, y: y+sub_w, :]
+            seged_p = img_p[x*mpratio: x*mpratio + sub_h*mpratio, y*mpratio: y*mpratio + sub_w*mpratio, :]
+            m_set.append(seged_m)
+            p_set.append(seged_p)
+    print('set length is {length}, shape is {shape}'.format(length=len(m_set), shape=m_set[0].shape))
+    return m_set, p_set
+
+def prepro_img(ori_m_set, ori_p_set, n_factor=4):
+    """
+    image set to blured or interpolation image set
+    """
+    num = len(ori_m_set)
+    print('num of set is:', num)
+    set_ml = []
+    set_pl = []
+    set_mli = []
+    set_m = []
+    for i in range(num):
+        temp_m = ori_m_set[i]
+        temp_p = ori_p_set[i]
+        M = mmnorm(temp_m)
+        P = mmnorm(temp_p)
+        ML, PL = image_blur(M, P, n_factor)
+        # print('image_M:', M.shape)
+        # print('image_P:', P.shape)
+        # print(mode,'ML shape:', ML.shape)
+        # print(mode,'PL shape:', PL.shape)
+        MLI = image_interpolation(ML)
+        # print(mode, 'MLI shape:', MLI.shape)
+        set_ml.append(ML)
+        set_pl.append(PL)
+        set_mli.append(MLI)
+        set_m.append(M)
+    return set_ml, set_pl, set_mli, set_m
+
+def save2h5_t2in(output_file, MLimg_set, PLimg_set, MLimg_I_set, Mimg_set, L_size, stride, n_factor, seedis=None, interpl='False'):
+    """
+    image mmnorm
+    """
+    img_num = len(MLimg_set)
+    LMh, LMw, LMb = MLimg_set[0].shape
+    print('lr image height is {LMh} width is {LMw}:'.format(LMh=LMh, LMw=LMw))
+    _, nmax, total = calcu_total((L_size, L_size), (LMh, LMw), (stride, stride))
+    ntotal = total * img_num
+    random.seed(seedis)
+    lis = random.sample(range(0, total), total)
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("ML", (ntotal, L_size, L_size, LMb),
+                         dtype='float64')
+        f.create_dataset("PL", (ntotal, L_size* n_factor, L_size* n_factor, 1),
+                         dtype='float64')
+        f.create_dataset("M", (ntotal, L_size* n_factor, L_size* n_factor, LMb),
+                         dtype='float64')
+        f.create_dataset("count", data=(0,))
+        f.create_dataset("MLI", (ntotal, L_size* n_factor, L_size* n_factor, LMb),
+                         dtype='float64')
+
+        for num in range(img_num):
+            for counter, value in enumerate(lis):
+                start = mn2xy(list2pos(value, nmax), stride)
+                Hstart = np.ones((2,), dtype=np.int)
+                Hstart[0] = LP2HP(start[0], n_factor, 0)
+                Hstart[1] = LP2HP(start[1], n_factor, 0)
+                if interpl=='False':
+                    temp1 = selectpatch(MLimg_set[num], start, L_size)
+                    f['ML'][counter + num * len(lis)] = temp1
+                elif interpl=='True':
+                    temp1 = selectpatch(MLimg_I_set[num], Hstart, L_size * n_factor)
+                    f['MLI'][counter + num * len(lis)] = temp1
+                else:
+                    print('interpolation mode is wrong.')
+                temp2 = selectpatch(Mimg_set[num], Hstart, L_size * n_factor)
+                f['M'][counter + num*len(lis)] = temp2
+                temp3 = selectpatch(PLimg_set[num], Hstart, L_size * n_factor)
+                f['PL'][counter + num*len(lis)] = temp3
+    print('train data with 2 input is ready.')
+    return
+
+def save2h5_t1in(output_file, MLimg_set, PLimg_set, MLimg_I_set, Mimg_set, L_size, stride, n_factor, seedis=None):
+    """
+    L_size and stride is according to ML size
+    MLimg_I.shape = Mimg.shape
+    """
+    img_num = len(MLimg_set)
+    LMh, LMw, LMb = MLimg_set[0].shape
+    print('lr image height is {LMh} width is {LMw}:'.format(LMh=LMh, LMw=LMw))
+    _, nmax, total = calcu_total((L_size, L_size), MLimg_set[0].shape, (stride, stride))
+    ntotal = total * img_num
+    random.seed(seedis)
+    lis = random.sample(range(0, total), total)
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("MPL", (ntotal, L_size* n_factor, L_size* n_factor, LMb+1),
+                         dtype='float64')
+        f.create_dataset("M", (ntotal, L_size* n_factor, L_size* n_factor, LMb),
+                         dtype='float64')
+        f.create_dataset("count", data=(0,))
+
+        for num in range(img_num):
+            for counter, value in enumerate(lis):
+                start = mn2xy(list2pos(value, nmax), stride)
+                Hstart = np.ones((2,), dtype=np.int)
+                Hstart[0] = LP2HP(start[0], n_factor, 0)
+                Hstart[1] = LP2HP(start[1], n_factor, 0)
+                temp1 = selectpatch(MLimg_I_set[num], Hstart, L_size * n_factor)
+                temp2 = selectpatch(PLimg_set[num], Hstart, L_size * n_factor)
+                temp3 = np.concatenate((temp1, temp2), axis=2)
+                f['MPL'][counter + num*len(lis)] = temp3
+                temp4 = selectpatch(Mimg_set[num], Hstart, L_size * n_factor)
+                f['M'][counter + num*len(lis)] = temp4
+    print('train data with 1 input is ready.')
+    return
+
+def sv2h5_ts2in(output_file, img_m_test, img_p_test, size_h, size_w, stride_h, stride_w, ratio=4, interpl='False'):
+    """
+        size and stride is according to the m_test size
+        """
+    assert size_h % 4 == 0, 'size_h % 4 is not int.'
+    assert size_w % 4 == 0, 'size_w % 4 is not int.'
+    h, w, b = img_m_test.shape
+    hp, wp, bp = img_p_test.shape
+    assert hp / h == wp / w, "M and P don't match."
+    mpratio = hp // h
+    assert mpratio == ratio, 'm and p ratio is wrong.'
+
+    mmax, nmax, total = calcu_total((size_h, size_w), img_m_test.shape, (stride_h, stride_w))
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("M", (total, size_h, size_w, b),
+                         dtype='float64')
+        f.create_dataset("ML", (total, size_h // ratio, size_w // ratio, b),
+                         dtype='float64')
+        f.create_dataset("PL", (total, size_h, size_w, 1),
+                         dtype='float64')
+        f.create_dataset("M_peak", (total, 2),
+                         dtype='int')
+        f.create_dataset("count", data=(0,))
+        f.create_dataset("MLI", (total, size_h, size_w, b),
+                         dtype='float64')
+        counter = 0
+        for m in range(mmax):
+            for n in range(nmax):
+                temp_m = img_m_test[m * stride_h:m * stride_h + size_h, n * stride_w:n * stride_w + size_w, :]
+                temp_m, temp_m_min, temp_m_max = mmnorm(temp_m, 'True')
+                temp_p = img_p_test[m * stride_h * mpratio:m * stride_h * mpratio + size_h * mpratio,
+                         n * stride_w * mpratio:n * stride_w * mpratio + size_w * mpratio, :]
+                temp_p = mmnorm(temp_p)
+                temp_ml, temp_pl = image_blur(temp_m, temp_p)
+
+                f['M'][counter] = temp_m
+                f['M_peak'][counter] = (temp_m_min, temp_m_max)
+                f['PL'][counter] = temp_pl
+                if interpl=='False':
+                    f['ML'][counter] = temp_ml
+                elif interpl=='True':
+                    temp_mli = image_interpolation(temp_ml)
+                    f['MLI'][counter] = temp_mli
+                else:
+                    print('interpolation mode is wrong.')
+                counter += 1
+    print('test data with 2 input is ready.')
+    return
+
+def sv2h5_ts1in(output_file, img_m_test, img_p_test, size_h, size_w, stride_h, stride_w, ratio=4):
+    """
+    size and stride is according to the m_test size
+    """
+    assert size_h % 4 == 0, 'size_h % 4 is not int.'
+    assert size_w % 4 == 0, 'size_w % 4 is not int.'
+    h, w, b = img_m_test.shape
+    hp, wp, bp = img_p_test.shape
+    assert hp / h == wp / w, "M and P don't match."
+    mpratio = hp // h
+    assert mpratio == ratio, 'm and p ratio is wrong.'
+
+    mmax, nmax, total = calcu_total((size_h, size_w), img_m_test.shape, (stride_h, stride_w))
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("MPL", (total, size_h, size_w, b + 1),
+                         dtype='float64')
+        f.create_dataset("M", (total, size_h, size_w, b),
+                         dtype='float64')
+        f.create_dataset("M_peak", (total, 2),
+                         dtype='int')
+        f.create_dataset("ML", (total, size_h // ratio, size_w // ratio, b),
+                         dtype='float64')
+        f.create_dataset("PL", (total, size_h, size_w, 1),
+                         dtype='float64')
+        f.create_dataset("count", data=(0,))
+        counter = 0
+
+        for m in range(mmax):
+            for n in range(nmax):
+                temp_m = img_m_test[m * stride_h:m * stride_h + size_h, n * stride_w:n * stride_w + size_w, :]
+                temp_m, temp_m_min, temp_m_max = mmnorm(temp_m, 'True')
+                temp_p = img_p_test[m * stride_h * mpratio:m * stride_h * mpratio + size_h * mpratio,
+                         n * stride_w * mpratio:n * stride_w * mpratio + size_w * mpratio, :]
+                temp_p = mmnorm(temp_p)
+                temp_ml, temp_pl = image_blur(temp_m, temp_p)
+                temp_mli = image_interpolation(temp_ml)
+
+                f['M'][counter] = temp_m
+                f['M_peak'][counter] = (temp_m_min, temp_m_max)
+                f['ML'][counter] = temp_ml
+                f['PL'][counter] = temp_pl
+                temp_mpl = np.concatenate((temp_mli, temp_pl), axis=2)
+                f['MPL'][counter] = temp_mpl
+                counter += 1
+                # print('counter:', counter)
+    print('test data with 1 input is ready.')
+    return
+
+def sv2h5_r2in(output_file, img_m_test, img_p_test, size_h, size_w, stride_h, stride_w, ratio=4, interpl='False'):
+    h, w, b = img_m_test.shape
+    hp, wp, bp = img_p_test.shape
+    assert hp / h == wp / w, "M and P don't match."
+    mpratio = hp // h
+    assert mpratio == ratio, 'm and p ratio is wrong.'
+
+    mmax, nmax, total = calcu_total((size_h, size_w), img_m_test.shape, (stride_h, stride_w))
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("M", (total, size_h, size_w, b),
+                         dtype='float64')
+        f.create_dataset("P", (total, size_h * ratio, size_w * ratio, 1),
+                         dtype='float64')
+        f.create_dataset("PL", (total, size_h, size_w, 1),
+                         dtype='float64')
+        f.create_dataset("M_peak", (total, 2),
+                         dtype='int')
+        f.create_dataset("count", data=(0,))
+        f.create_dataset("MI", (total, size_h * ratio, size_w * ratio, b),
+                         dtype='float64')
+        counter = 0
+        for m in range(mmax):
+            for n in range(nmax):
+                temp_m = img_m_test[m * stride_h:m * stride_h + size_h, n * stride_w:n * stride_w + size_w, :]
+                temp_m, temp_m_min, temp_m_max = mmnorm(temp_m, 'True')
+                temp_p = img_p_test[m * stride_h * mpratio:m * stride_h * mpratio + size_h * mpratio,
+                         n * stride_w * mpratio:n * stride_w * mpratio + size_w * mpratio, :]
+                temp_p = mmnorm(temp_p)
+                temp_ml, temp_pl = image_blur(temp_m, temp_p)
+                if interpl=='False':
+                    f['M'][counter] = temp_m
+                elif interpl=='True':
+                    temp_mi = image_interpolation(temp_m)
+                    f['MI'][counter] = temp_mi
+                else:
+                    print('interpolation mode is wrong.')
+                f['M_peak'][counter] = (temp_m_min, temp_m_max)
+                f['P'][counter] = temp_p
+                f['PL'][counter] = temp_pl
+                counter += 1
+    print('real data with 2 input is ready.')
+    return
+
+def sv2h5_r1in(output_file, img_m_test, img_p_test, size_h, size_w, stride_h, stride_w, ratio=4):
+    h, w, b = img_m_test.shape
+    hp, wp, bp = img_p_test.shape
+    assert hp / h == wp / w, "M and P don't match."
+    mpratio = hp // h
+    assert mpratio == ratio, 'm and p ratio is wrong.'
+
+    mmax, nmax, total = calcu_total((size_h, size_w), img_m_test.shape, (stride_h, stride_w))
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("MP", (total, size_h * ratio, size_w * ratio, b + 1),
+                         dtype='float64')
+        f.create_dataset("PL", (total, size_h, size_w, 1),
+                         dtype='float64')
+        f.create_dataset("M", (total, size_h, size_w, b),
+                         dtype='float64')
+        f.create_dataset("M_peak", (total, 2),
+                         dtype='int')
+        f.create_dataset("P", (total, size_h * ratio, size_w * ratio, 1),
+                         dtype='float64')
+        f.create_dataset("count", data=(0,))
+        counter = 0
+        for m in range(mmax):
+            for n in range(nmax):
+                temp_m = img_m_test[m * stride_h:m * stride_h + size_h, n * stride_w:n * stride_w + size_w, :]
+                temp_m, temp_m_min, temp_m_max = mmnorm(temp_m, 'True')
+                temp_p = img_p_test[m * stride_h * mpratio:m * stride_h * mpratio + size_h * mpratio,
+                         n * stride_w * mpratio:n * stride_w * mpratio + size_w * mpratio, :]
+                temp_p = mmnorm(temp_p)
+                temp_ml, temp_pl = image_blur(temp_m, temp_p)
+                temp_mi = image_interpolation(temp_m)
+                f['M'][counter] = temp_m
+                f['M_peak'][counter] = (temp_m_min, temp_m_max)
+                f['P'][counter] = temp_p
+                f['PL'][counter] = temp_pl
+                temp_mp = np.concatenate((temp_mi, temp_p), axis=2)
+                f['MP'][counter] = temp_mp
+                counter += 1
+    print('real data with 1 input is ready.')
+    return
+
+
+def sv2h5_spec(output_file, data_set, gt, indices):
+    h, w, b = data_set.shape
+    num = len(indices)
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("data", (num, b), dtype='float64')
+        f.create_dataset("gt", (num, 1), dtype='int')
+        f.create_dataset("count", data=(0,))
+        for i in range(num):
+            temp_index = list2pos(indices[i], w)
+            temp_data = data_set[temp_index[0]][temp_index[1]]
+            temp_gt = gt[temp_index[0]][temp_index[1]]
+            f['data'][i] = temp_data
+            f['gt'][i] = temp_gt
+    # print('data is ready.')
+    return
+
+
+def sv2h5_pair_spec(output_file, data_set, gt, indices):
+    h, w, b = data_set.shape
+    num = len(indices)
+    remove_if_exist(output_file)
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset("data", (num, b), dtype='float64')
+        f.create_dataset("gt", (num, 1), dtype='int')
+        f.create_dataset("count", data=(0,))
+        for i in range(num):
+            temp_index = list2pos(indices[i], w)
+            temp_data = data_set[temp_index[0]][temp_index[1]]
+            temp_gt = gt[temp_index[0]][temp_index[1]]
+            f['data'][i] = temp_data
+            f['gt'][i] = temp_gt
+    # print('data is ready.')
+    return
+
+
+def dataset_select(file_name, key_name, select_num_list):
+    data_file = h5py.File(file_name,'r')
+    dataset = data_file[key_name]
+    print('origin set shape:', dataset.shape)
+    num = len(select_num_list)
+    print('select', num,'from:'+key_name)
+    select_data = np.empty((num, dataset.shape[1], dataset.shape[2], dataset.shape[3]), dtype=float)
+    print('select_data.shape:', select_data.shape)
+    for i in range(num):
+        print('No.', i, 'is ', select_num_list[i], 'in original set.')
+        select_data[i] = dataset[select_num_list[i]]
+    return select_data
+
+def stretchlim(img):
+    # Determine size of image in pixels
+    sz = np.shape(img)
+    # print('sz',sz)
+    num_of_px = sz[0]*sz[1]
+    # Determine one percent of total pixels (for use in image adjust code)
+    one_perc = math.floor(num_of_px*0.01)
+    lims = np.zeros((sz[2],2))
+    # Compute lower/upper 1% threshold for each channel
+    for i in range(0,sz[2]):
+        bmin = np.min(img[:,:,i])
+        bmax = np.max(img[:,:,i])
+        bbin = 200 #1based
+        hist,bins = np.histogram(a=img[:,:,i].ravel(),bins=bbin,range=[bmin,bmax])
+        val = 0
+        j = 0
+        while val < one_perc:
+            val = val+hist[j]
+            j = j +1
+        lims[i,0] = bins[j]
+
+        val = 0
+        j = 0
+        while val < one_perc:
+            val = val+hist[bbin-1-j]
+            j = j + 1
+        lims[i,1] = bins[bbin-1-j]
+    return lims
+
+
+def imadjust(img, lims):
+    img2 = np.copy(img)
+    sz = np.shape(img2)
+    for i in range(0,sz[2]):
+        I2 = img2[:,:,i]
+        I2[I2 > lims[i,1]] = lims[i,1]
+        I2[I2 < lims[i,0]] = lims[i,0]
+        img2[:,:,i] = (I2-lims[i,0])/(lims[i,1]-lims[i,0])
+    return img2
+
+
+if __name__ == '__main__':
+    data_name = 'Indian_pines_corrected'
+    label_name = 'Indian_pines_gt'
+    data = mat_read(data_name)
+    label = mat_read(label_name)
