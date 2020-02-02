@@ -1,0 +1,36 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# author：S.Yao time:20-1-27
+import numpy as np
+import os
+from data.dataset_utils import mat_read, sampling_num, sv2h5_spec, mmnorm
+import h5py
+
+if __name__ == '__main__':
+    data_name = 'Indian_pines_corrected'
+    label_name = 'Indian_pines_gt'
+    data_or = mat_read(data_name)
+    print('mat original_image max:{max} min:{min}'.format(max=np.max(data_or), min=np.min(data_or)))
+    data = mmnorm(data_or)
+    print('mat image max:{max} min:{min}'.format(max=np.max(data), min=np.min(data)))
+    label = mat_read(label_name)
+    total_train = 30
+    whole_indices, train_indices, test_indices, new_label = sampling_num(total_train, label, seeds=1223)
+    sv2h5_spec('indian_train.h5', data, new_label, train_indices)
+    sv2h5_spec('indian_test.h5', data, new_label, test_indices)
+    # sv2h5_spec('indian_all.h5', data, label, whole_indices)
+    train_data = h5py.File('indian_train.h5', 'r')
+    train_set = train_data['data']
+    train_label = train_data['gt']
+    print(train_set.shape, train_label.shape)
+    test_data = h5py.File('indian_test.h5', 'r')
+    test_set = test_data['data']
+    test_label = test_data['gt']
+    print(test_set.shape, test_label.shape)
+    # all_data = h5py.File('indian_all.h5', 'r')
+    # all_set = all_data['data']
+    # all_label = all_data['gt']
+    # print(all_set.shape, all_label.shape)
+
+
+
